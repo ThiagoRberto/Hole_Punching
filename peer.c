@@ -13,6 +13,9 @@
 #define MAX_ATTEMPTS 16
 #define PUNCH_ROUNDS 40
 
+#define REQUEST_RETRY_INTERVAL_SEC 2
+#define REQUEST_MAX_RETRIES 0
+
 int set_nonblocking(int fd) {
     // Do a non-blocking read, avoid the program to be stucked in reading.
     int flags = fcntl(fd, F_GETFL, 0);
@@ -106,12 +109,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to register with server\n");
     }
 
+    time_t last_request_time = 0;
+    int request_attempts = 0;
+    char req_msg[BUFFER_SIZE] = {0};
+    
     // If a target was given, request connection
     if (want_connect) {
         char req[BUFFER_SIZE];
         snprintf(req, sizeof(req), "REQUEST %s %s", my_id, target_id);
         sendto(sock, req, strlen(req), 0, (struct sockaddr*)&server, sizeof(server));
         printf("Sent REQUEST for %s\n", target_id);
+        last_request_time = time(NULL);
+        request_attempts = 1;
+        snprintf(req_msg, sizeof(req_msg), "REQUEST %s %s", my_id, target_id);
     }
 
     // Wait for PEER messages and for punching
@@ -160,13 +170,23 @@ int main(int argc, char **argv) {
                     }
                 } else if (strncmp(buffer, "PUNCH ", 6) == 0 || strstr(buffer, "PUNCH") != NULL) {
                     // Received a punch from peer, connection established
-                    char addrstr[64];
-                    inet_ntop(AF_INET, &from.sin_addr, addrstr, sizeof(addrstr));
-                    printf("Received PUNCH from %s:%d -> %s\n", addrstr, ntohs(from.sin_port), buffer);
-                    connected = 1;
-                    char ack[BUFFER_SIZE];
-                    snprintf(ack, sizeof(ack), "Message %s: ACK from %s", peer_id, my_id);
-                    sendto(sock, ack, strlen(ack), 0, (struct sockaddr*)&from, flen);
+                    if (!connected) {
+                        char addrstr[64];
+                        inet_ntop(AF_INET, &from.sin_addr, addrstr, sizeof(addrstr));
+                        printf("Received PUNCH from %s:%d -> %s\n",
+                            addrstr, ntohs(from.sin_port), buffer);
+
+                        connected = 1;
+
+                        char ack[BUFFER_SIZE];
+                        snprintf(ack, sizeof(ack), "MSG %s: ACK from %s",
+                                peer_id[0] ? peer_id : "peer", my_id);
+                        sendto(sock, ack, strlen(ack), 0,
+                            (struct sockaddr*)&from, flen);
+
+                        printf("Connection established with peer %s\n",
+                            peer_id[0] ? peer_id : "unknown");
+                    }
                 } else if (strncmp(buffer, "Message ", 4) == 0) {
                     char addrstr[64];
                     inet_ntop(AF_INET, &from.sin_addr, addrstr, sizeof(addrstr));
@@ -194,6 +214,36 @@ int main(int argc, char **argv) {
                 }
             }
         } 
+
+        // If we want to connect and we don't have peer info yet, periodically resend REQUEST.
+        if (want_connect && !have_peer) {
+            time_t now = time(NULL);
+            int should_send = 0;
+            if (request_attempts == 0) {
+                should_send = 1;
+            } else if (REQUEST_MAX_RETRIES == 0 || request_attempts < REQUEST_MAX_RETRIES) {
+                if ((now - last_request_time) >= REQUEST_RETRY_INTERVAL_SEC) should_send = 1;
+            } else {
+                static int exhausted_printed = 0;
+                if (!exhausted_printed) {
+                    fprintf(stderr, "REQUEST attempts exhausted (%d). Target not found.\n", REQUEST_MAX_RETRIES);
+                    exhausted_printed = 1;
+                }
+            }
+
+            if (should_send) {
+                if (strlen(req_msg) == 0) {
+                    snprintf(req_msg, sizeof(req_msg), "REQUEST %s %s", my_id, target_id);
+                }
+                if (sendto(sock, req_msg, strlen(req_msg), 0, (struct sockaddr*)&server, sizeof(server)) < 0) {
+                    perror("sendto REQUEST");
+                } else {
+                    last_request_time = time(NULL);
+                    request_attempts++;
+                    printf("Sent REQUEST for %s (attempt %d)\n", target_id, request_attempts);
+                }
+            }
+        }
 
         // If we have peer info but not connected, send repeated PUNCH attempts
         if (have_peer && !connected) {
